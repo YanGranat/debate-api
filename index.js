@@ -1,5 +1,3 @@
-// === ПОЛНАЯ ВЕРСИЯ ВАШЕГО КОДА С ТОЧЕЧНЫМИ ИСПРАВЛЕНИЯМИ ===
-
 import "dotenv/config";
 
 import express from "express";
