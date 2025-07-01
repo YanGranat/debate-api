@@ -1,0 +1,16 @@
+{
+  "name": "debate-api",
+  "version": "1.0.0",
+  "description": "Backend for Debat-Arena GPT",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0-alpha.1",
+    "ioredis": "^5.4.1",
+    "uuid": "^9.0.1"
+  }
+}
