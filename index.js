@@ -12,22 +12,54 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Получаем префикс из переменных окружения, чтобы изолировать данные этого проекта
 const REDIS_PREFIX = process.env.REDIS_PREFIX || 'debate-arena:';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'ывп7ус38сг'; // Ваш секретный пароль
 
-// Вспомогательная функция, которая добавляет префикс ко всем ключам в Redis
 const prefixKey = (key) => `${REDIS_PREFIX}${key}`;
 
-// Подключение к Redis
 const redis = new Redis(process.env.REDIS_URL);
 redis.on("connect", () => console.log("✅ Redis connected"));
 redis.on("error", (err) => console.error("🛑 Redis error", err));
 
 // ==================
-// КЛЮЧИ ДЛЯ REDIS (уже с префиксами)
+// Middleware (Прослойки для проверок)
+// ==================
+
+// Проверяет пароль админа для защищенных эндпоинтов
+const adminAuth = (req, res, next) => {
+    const password = req.get('X-Admin-Password');
+    if (password === ADMIN_PASSWORD) {
+        next();
+    } else {
+        res.status(403).json({ error: 'Forbidden: Invalid Admin Password' });
+    }
+};
+
+// Проверяет, не забанен ли пользователь, перед выполнением действия
+const checkUserStatus = async (req, res, next) => {
+    try {
+        // Универсальный поиск ID пользователя в запросе
+        const userId = req.params.user || req.params.id || req.body.from || req.body.user || (req.body.fromUser);
+        if (userId) {
+            const userStatus = await redis.hget(prefixKey(`user:${userId}`), 'status');
+            if (userStatus === 'banned') {
+                return res.status(403).json({ error: `Action forbidden: User '${userId}' is banned.` });
+            }
+        }
+        next();
+    } catch (error) {
+        console.error("Status check middleware error:", error);
+        res.status(500).json({ error: 'Internal server error during status check' });
+    }
+};
+
+// ==================
+// КЛЮЧИ ДЛЯ REDIS
 // ==================
 
 const KEY_USER = (id) => prefixKey(`user:${id}`);
+const KEY_ALL_USERS = prefixKey("users:all"); // НОВЫЙ КЛЮЧ
+const KEY_INACTIVE_USERS = prefixKey("users:inactive");
 const KEY_CLAIMS = (id) => prefixKey(`claims:${id}`);
 const KEY_DEBATES = (id) => prefixKey(`debates:${id}`);
 const KEY_DEBATE = (id) => prefixKey(`debate:${id}`);
@@ -37,7 +69,6 @@ const KEY_STATS = (id) => prefixKey(`stats:${id}`);
 const KEY_LEADER = prefixKey("leaderboard");
 const KEY_INBOX = (id) => prefixKey(`inbox:${id}`);
 const KEY_FINISH = (id) => prefixKey(`finish:${id}`);
-const KEY_INACTIVE_USERS = prefixKey("users:inactive");
 const KEY_INVITATION = (id) => prefixKey(`invitation:${id}`);
 const KEY_USER_INVITATIONS = (id) => prefixKey(`invitations:${id}`);
 
@@ -50,17 +81,14 @@ const KEY_USER_INVITATIONS = (id) => prefixKey(`invitations:${id}`);
 app.post("/user", async (req, res) => {
     try {
         const { name, bio } = req.body;
-        // ЗАЩИТА: Проверка наличия обязательных данных
         if (!name || typeof name !== 'string' || name.trim() === '') {
             return res.status(400).json({ error: "Name is required and must be a non-empty string." });
         }
-
         const id = name;
         const exists = await redis.exists(KEY_USER(id));
         if (exists) {
             return res.status(409).json({ error: "User already exists", userId: id });
         }
-
         await redis.hset(KEY_USER(id), {
             name,
             bio: bio || "Информация не предоставлена.",
@@ -68,7 +96,7 @@ app.post("/user", async (req, res) => {
             createdAt: Date.now(),
         });
         await redis.sadd(KEY_INACTIVE_USERS, id);
-
+        await redis.sadd(KEY_ALL_USERS, id); // ДОБАВЛЕНО
         res.status(201).json({ userId: id, name });
     } catch (error) {
         console.error("Error in POST /user:", error);
@@ -80,7 +108,6 @@ app.get("/user/:id", async (req, res) => {
     try {
         const { id } = req.params;
         const data = await redis.hgetall(KEY_USER(id));
-        // ЗАЩИТА: Проверка, что пользователь найден
         if (!data || Object.keys(data).length === 0) {
             return res.status(404).json({ error: "User not found" });
         }
@@ -91,6 +118,7 @@ app.get("/user/:id", async (req, res) => {
     }
 });
 
+// Этот эндпоинт устарел, так как его заменили админские функции, но оставляем на всякий случай
 app.patch("/user/:id", async (req, res) => {
     try {
         const { id } = req.params;
@@ -99,7 +127,6 @@ app.patch("/user/:id", async (req, res) => {
 
         const updates = {};
         if (req.body.status) updates.status = req.body.status;
-        // Можно добавить другие поля для обновления здесь
 
         if (Object.keys(updates).length > 0) {
             await redis.hset(KEY_USER(id), updates);
@@ -119,7 +146,6 @@ app.get("/inbox/:user", async (req, res) => {
         const key = KEY_INBOX(req.params.user);
         const msgs = await redis.lrange(key, 0, -1);
         if (msgs.length > 0) {
-            // Очищаем inbox после прочтения
             await redis.del(key);
         }
         res.json(msgs);
@@ -129,12 +155,10 @@ app.get("/inbox/:user", async (req, res) => {
     }
 });
 
-
 // ───────── Утверждения (claims) ─────────
 
-app.post("/user/:user/claim", async (req, res) => {
+app.post("/user/:user/claim", checkUserStatus, async (req, res) => {
     try {
-        // ЗАЩИТА: Проверка наличия текста утверждения
         if (!req.body.text || typeof req.body.text !== 'string' || req.body.text.trim() === '') {
             return res.status(400).json({ error: "Claim text is required." });
         }
@@ -147,9 +171,6 @@ app.post("/user/:user/claim", async (req, res) => {
     }
 });
 
-// ... (остальной код будет следовать тому же шаблону защиты)
-// Полный код ниже
-
 app.get("/user/:user/claims", async (req, res) => {
   try {
     const raw = await redis.lrange(KEY_CLAIMS(req.params.user), 0, -1);
@@ -160,17 +181,15 @@ app.get("/user/:user/claims", async (req, res) => {
   }
 });
 
-app.delete("/user/:user/claim/:claimId", async (req, res) => {
+app.delete("/user/:user/claim/:claimId", checkUserStatus, async (req, res) => {
   try {
     const key = KEY_CLAIMS(req.params.user);
     const list = await redis.lrange(key, 0, -1);
     const claimToDelete = list.find(item => JSON.parse(item).id === req.params.claimId);
-
     if (claimToDelete) {
       await redis.lrem(key, 0, claimToDelete);
       return res.json({ deleted: true, claimId: req.params.claimId });
     }
-    
     res.status(404).json({ deleted: false, error: "Claim not found" });
   } catch (error) {
     console.error(`Error in DELETE /user/${req.params.user}/claim/${req.params.claimId}:`, error);
@@ -183,7 +202,7 @@ app.get("/user/:user/contradictions", async (req, res) => {
     const keys = await redis.keys(prefixKey("claims:*"));
     const out = {};
     for (const k of keys) {
-      const u = k.split(":")[2]; // Adjusted for prefix
+      const u = k.split(":")[2];
       if (u === req.params.user) continue;
       const raw = await redis.lrange(k, 0, -1);
       if (raw.length > 0) {
@@ -199,7 +218,7 @@ app.get("/user/:user/contradictions", async (req, res) => {
 
 // ───────── Поиск оппонентов ─────────
 
-app.get("/match/:user", async (req, res) => {
+app.get("/match/:user", checkUserStatus, async (req, res) => {
   try {
     const fullUrl = `${req.protocol}://${req.get('host')}/user/${req.params.user}/contradictions`;
     const response = await axios.get(fullUrl);
@@ -223,10 +242,9 @@ app.get("/match/:user", async (req, res) => {
 
 // ───────── Приглашения ─────────
 
-app.post("/invitation", async (req, res) => {
+app.post("/invitation", checkUserStatus, async (req, res) => {
   try {
     const { fromUser, toUser, topic } = req.body;
-    // ЗАЩИТА: Проверка входных данных
     if (!fromUser || !toUser || !topic) {
         return res.status(400).json({ error: "fromUser, toUser, and topic are required." });
     }
@@ -241,7 +259,7 @@ app.post("/invitation", async (req, res) => {
   }
 });
 
-app.post("/invitation/:id/accept", async (req, res) => {
+app.post("/invitation/:id/accept", checkUserStatus, async (req, res) => {
     try {
         const { id } = req.params;
         const invData = await redis.hgetall(KEY_INVITATION(id));
@@ -260,7 +278,7 @@ app.post("/invitation/:id/accept", async (req, res) => {
     }
 });
 
-app.post("/invitation/:id/reject", async (req, res) => {
+app.post("/invitation/:id/reject", checkUserStatus, async (req, res) => {
     try {
         const { id } = req.params;
         const invData = await redis.hgetall(KEY_INVITATION(id));
@@ -312,11 +330,10 @@ app.get("/debates/:user", async (req, res) => {
   }
 });
 
-app.post("/debate/:id/message", async (req, res) => {
+app.post("/debate/:id/message", checkUserStatus, async (req, res) => {
   try {
     const { from, text } = req.body;
     const debateId = req.params.id;
-    // ЗАЩИТА: Проверка входных данных
     if (!from || !text) {
         return res.status(400).json({ error: "from and text are required." });
     }
@@ -326,7 +343,7 @@ app.post("/debate/:id/message", async (req, res) => {
 
     await redis.rpush(KEY_HISTORY(debateId), JSON.stringify(msg));
     const to = from === m.userA ? m.userB : m.userA;
-    await redis.hset(KEY_DEBATE(debateId), 'turn', to); // Смена хода
+    await redis.hset(KEY_DEBATE(debateId), 'turn', to);
     await redis.rpush(KEY_INBOX(to),`💬 Новое сообщение в дебате «${m.topic}» (ID: ${debateId}) от ${from}: ${text}`);
     res.json({ delivered: true });
   } catch(error) {
@@ -345,7 +362,7 @@ app.get("/debate/:id/history", async (req, res) => {
     }
 });
 
-app.post("/debate/:id/finish", async (req, res) => {
+app.post("/debate/:id/finish", checkUserStatus, async (req, res) => {
   try {
     const { user, wantWinner } = req.body;
     if (user === undefined || wantWinner === undefined) {
@@ -365,23 +382,16 @@ app.post("/debate/:id/finish", async (req, res) => {
 
     if (otherFlag === "want") {
         const hist = (await redis.lrange(KEY_HISTORY(id), 0, -1)).map(JSON.parse);
-        const cnt = hist.reduce((a, x) => {
-            a[x.from] = (a[x.from] || 0) + 1;
-            return a;
-        }, {});
+        const cnt = hist.reduce((a, x) => { a[x.from] = (a[x.from] || 0) + 1; return a; }, {});
         const winner = (cnt[m.userA] || 0) >= (cnt[m.userB] || 0) ? m.userA : m.userB;
         const loser = winner === m.userA ? m.userB : m.userA;
-
         await redis.hset(KEY_DEBATE(id),"status","ended","winner",winner,"endedAt",Date.now());
         await redis.hincrby(KEY_STATS(winner), "wins", 1);
         await redis.hincrby(KEY_STATS(loser), "losses", 1);
-
         const [winsW, lossesW] = await redis.hmget(KEY_STATS(winner), "wins", "losses");
         const [winsL, lossesL] = await redis.hmget(KEY_STATS(loser), "wins", "losses");
-
         await redis.zadd(KEY_LEADER, Number(winsW || 0) - Number(lossesW || 0), winner);
         await redis.zadd(KEY_LEADER, Number(winsL || 0) - Number(lossesL || 0), loser);
-
         await redis.rpush(KEY_INBOX(other), `🏆 Дебат «${m.topic}» завершен. Победитель: ${winner}!`);
         return res.json({ ended: true, winner });
     }
@@ -406,7 +416,6 @@ app.get("/user/:user/context", async (req, res) => {
             debates.push({ debateId: id, ...debateData });
         }
     }
-    
     const stats = await redis.hgetall(KEY_STATS(u));
     const lb = await redis.zrevrange(KEY_LEADER, 0, 4, "WITHSCORES");
     const leaderboard = [];
@@ -422,7 +431,6 @@ app.get("/user/:user/context", async (req, res) => {
             invitations.push({ invitationId: id, ...invData });
         }
     }
-    
     res.json({ user: u, profile: userProfile, claims, debates, stats, leaderboard, invitations });
   } catch (error) {
     console.error(`Error in GET /user/${req.params.user}/context:`, error);
@@ -445,9 +453,140 @@ app.get("/leaderboard", async (_req, res) => {
     }
 });
 
+// ==================
+// АДМИН-ПАНЕЛЬ (НОВЫЙ РАЗДЕЛ)
+// ==================
+const adminRouter = express.Router();
+adminRouter.use(adminAuth); // Все команды ниже требуют пароль
+
+// 1. ПОЛУЧИТЬ СПИСОК ПОЛЬЗОВАТЕЛЕЙ (с фильтрами)
+adminRouter.get('/users', async (req, res) => {
+    try {
+        const statusFilter = req.query.status; // 'active', 'inactive', 'banned'
+        let userIds;
+        if (statusFilter === 'inactive') {
+            userIds = await redis.smembers(KEY_INACTIVE_USERS);
+        } else {
+            userIds = await redis.smembers(KEY_ALL_USERS);
+        }
+        
+        const usersData = [];
+        for (const userId of userIds) {
+            const user = await redis.hgetall(KEY_USER(userId));
+            // Применяем фильтр, если он есть
+            if (user.name && (!statusFilter || user.status === statusFilter)) {
+                usersData.push({ name: user.name, bio: user.bio, status: user.status, createdAt: new Date(parseInt(user.createdAt)).toISOString() });
+            }
+        }
+        res.json(usersData);
+    } catch (error) { res.status(500).json({ error: 'Internal Server Error', details: error.message }); }
+});
+
+// 2. ИЗМЕНИТЬ СТАТУС ПОЛЬЗОВАТЕЛЯ (активировать, банить, разбанить)
+adminRouter.post('/user/:userId/status', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { status } = req.body; // 'active' или 'banned'
+
+        if (!['active', 'banned'].includes(status)) {
+            return res.status(400).json({ error: "Invalid status. Use 'active' or 'banned'."});
+        }
+        
+        const userKey = KEY_USER(userId);
+        if (!(await redis.exists(userKey))) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        await redis.hset(userKey, 'status', status);
+        
+        // Убираем из очереди на активацию в любом случае (активация или бан)
+        await redis.srem(KEY_INACTIVE_USERS, userId);
+        
+        res.json({ success: true, message: `User ${userId} status changed to ${status}` });
+    } catch (error) { res.status(500).json({ error: 'Internal Server Error', details: error.message }); }
+});
+
+// 3. ПОЛНОСТЬЮ УДАЛИТЬ ПОЛЬЗОВАТЕЛЯ (Опасно!)
+adminRouter.delete('/user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!(await redis.exists(KEY_USER(userId)))) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Транзакция для атомарного удаления основных данных
+        const pipeline = redis.pipeline();
+        pipeline.del(KEY_USER(userId));
+        pipeline.srem(KEY_ALL_USERS, userId);
+        pipeline.srem(KEY_INACTIVE_USERS, userId);
+        pipeline.del(KEY_CLAIMS(userId));
+        pipeline.del(KEY_DEBATES(userId));
+        pipeline.del(KEY_STATS(userId));
+        pipeline.zrem(KEY_LEADER, userId);
+
+        await pipeline.exec();
+        res.json({ success: true, message: `User ${userId} and all related primary data have been deleted.`});
+    } catch (error) { res.status(500).json({ error: 'Internal Server Error', details: error.message }); }
+});
+
+// 4. ЭКСПОРТИРОВАТЬ ДЕБАТ
+adminRouter.get('/debate/:debateId/export', async (req, res) => {
+    try {
+        const { debateId } = req.params;
+        const debateKey = KEY_DEBATE(debateId);
+
+        if (!(await redis.exists(debateKey))) {
+            return res.status(404).json({ error: 'Debate not found' });
+        }
+
+        const [metadata, historyRaw] = await Promise.all([
+            redis.hgetall(debateKey),
+            redis.lrange(KEY_HISTORY(debateId), 0, -1)
+        ]);
+
+        const history = historyRaw.map(JSON.parse);
+        res.json({ metadata, history });
+    } catch (error) { res.status(500).json({ error: 'Internal Server Error', details: error.message }); }
+});
+
+// 5. ОЧИСТИТЬ ДАННЫЕ (Очень опасно!)
+adminRouter.post('/clear-data', async (req, res) => {
+    try {
+        const { target } = req.body; // 'users', 'debates', 'all'
+        
+        let pattern;
+        switch (target) {
+            case 'users': pattern = prefixKey('user:*'); break;
+            case 'debates': pattern = prefixKey('debate:*'); break;
+            case 'all': pattern = prefixKey('*'); break;
+            default: return res.status(400).json({ error: "Invalid target. Use 'users', 'debates', or 'all'." });
+        }
+
+        const stream = redis.scanStream({ match: pattern, count: 100 });
+        const keysToDelete = [];
+        stream.on('data', (keys) => {
+            if (keys.length) {
+                keysToDelete.push(...keys);
+            }
+        });
+        await new Promise((resolve) => stream.on('end', resolve));
+
+        if (keysToDelete.length > 0) {
+            await redis.del(keysToDelete);
+        }
+
+        if(target === 'all') {
+            await redis.del(KEY_LEADER, KEY_ALL_USERS, KEY_INACTIVE_USERS);
+        }
+
+        res.json({ success: true, message: `Successfully cleared target '${target}'. ${keysToDelete.length} keys deleted.` });
+    } catch (error) { res.status(500).json({ error: 'Internal Server Error', details: error.message }); }
+});
+
+// Подключаем админ-роутер к основному приложению
+app.use('/admin', adminRouter);
+
 app.get("/openapi.json", (req, res) => {
-  // Эта часть кода остается без изменений, т.к. она генерирует статичную схему
-  // и не взаимодействует с базой данных.
   const host = req.get('host');
   const schema = {
     openapi: "3.1.0",
